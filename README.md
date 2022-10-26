@@ -1,2 +1,2 @@
-# Chapter4
-Code for analysis and figures for Chapter 4
+# Legumes associated with both Actinobacteria and rhizobia show higher nitrogen fixation rates than with only rhizobia partners
+Code for analysis and figures for manuscript on Neotropical legume seedling nodule bacteriomes
