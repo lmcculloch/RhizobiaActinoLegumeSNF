@@ -1,0 +1,1070 @@
+---
+title: "Chapter 4 Analysis Clean"
+output: html_notebook
+---
+
+##Loading packages
+```{r}
+#Load package####
+library(tidyverse)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+
+#library(vegetarian)
+library(data.table)
+library(VennDiagram)
+library(phyloseq)
+library(vegan)
+library(microbiome)
+library(devtools)
+library("gamlss")
+library(PMA)
+library(RColorBrewer)
+library(viridis)
+
+
+#install.packages("devtools") #if you don't have devtools
+devtools::install_github("jbisanz/qiime2R")
+library(qiime2R)
+install_github('fawda123/ggord')
+library(ggord)
+install_github("vmikk/metagMisc")
+library("metagMisc")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+#BiocManager::install("microbiome")
+#BiocManager::install("DESeq2")
+library(microbiome)
+#library(DESeq2)
+#Set seed for reproducible data
+set.seed(13)
+```
+
+
+##Loading meta data and calculating SNF variables
+```{r}
+setwd('/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4')
+meta = read.csv("LS_Rhiz_data_meta.csv")
+#meta = meta[,1:32]
+meta$type = "Gap"
+meta$type[meta$Site > 5] = "Intact_Forest"
+meta$type = as.factor(meta$type)
+meta$Site = as.factor(meta$Site)
+meta$nod.ex.mass[is.na(meta$nod.ex.mass)] = 0
+meta$S.num = as.factor(meta$S.num)
+meta$S.num <- revalue(meta$S.num, c("1" = "P.mac", "2" = "Z.lon","3" = "S.mic"))
+meta$P.num = as.character(meta$P.num)
+
+data.info = meta%>%
+  group_by(S.num, light, nitro) %>%
+  summarise(
+    n=length(nod.ex.mass)
+  )
+
+#Changing total N in isotope samples from micrograms to miligrams 
+meta$Total.N.e <- meta$total.N.15n*.001
+meta$Total.N.c <- meta$total.N.c*.001
+#Calculating %N for each sample from the total N and sample weight of enriched samples ####
+meta$XN.e<-((meta$Total.N.e)/meta$mg.tin.e)*100
+
+#Calculating %N for each sample from the total N and sample weight of control samples ####
+meta$XN.c<-((meta$total.N.c)/meta$mg.tin.c)*100
+
+#Syringe Volume replaced (proportion), Enrichment of normal atmosphere, enrichment of added gas ####
+svr<-.2
+X15Nair<-.003663
+X15Ngas<-.99
+svr.c <- 0
+
+#Calculating the expected enrichment of syringe headspace during incubation.
+#this will be very close to the volume replaced times the %15Ngas (how close depends on how close the gas enrichment is to 100%)
+syr.enrich<-(X15Ngas*svr)+(X15Nair*(1-svr))
+syr.enrich.c <-(X15Ngas*svr.c)+(X15Nair*(1-svr.c))
+
+#Now the Percent of N atoms fixed in each sample calculated is by 
+#taking the difference between the enriched X15N and control X15N and (?dividing by expected enrichment)
+#meta$XNfixd<-with(meta, (X15n.atX.15n-X15n.atX.c)/syr.enrich)
+meta$XNfixdX<-with(meta, (X15n.atX.15n-X15n.atX.c))
+#Some samples only ended up having values for controls because enriched samples were below detection limit, 
+#to avoid negatives I made them zeros
+meta$XNfixdX[meta$XNfixdX < 0] = 0 
+
+#Calculating the total amount of N (g) in the incubated sample amount. n15.mass is in grams
+meta$tot.N<-with(meta, (n15.mass)*XN.e)
+
+#calculating the amount of N fixed in each sample (gN fixed per sample per incubation period) check units?
+meta$Nfixd.sample<-with(meta, tot.N*XNfixdX)
+
+#Calculating N fixation to units of (gN fixed per gram of nodule per hour) "SNF efficiency"####
+#gN fixed per sample divided by the mass of nodules that were incubated (n15.mass)
+meta$Nfixd<-with(meta, (Nfixd.sample/n15.mass)*2)
+meta$Nfixd[is.na(meta$Nfixd)] = 0
+#Converting N fixation to units of (gN fixed per gram of nodule per year)
+time.conv<-17520 #the number of "half hours" in a year
+meta$Nfixd.yr<-with(meta, (Nfixd.sample/n15.mass)*time.conv)
+
+#calculating total N fixed per plant ####
+#Taking "SNF efficiency" and multiplying by the total nodule mass 
+meta$totnodmass = with(meta, (nod.ex.mass+n15.mass+c.mass))
+meta$tot.Nfixd <- with(meta, (Nfixd*totnodmass))
+meta$tot.Nfixd[is.na(meta$tot.Nfixd)] = 0
+
+#calculating total N fixed per g of plant####
+#Taking total N fixed per plant and dividing by the plants total mass
+meta$totmass = with(meta, (l.mass+r.mass+s.mass+totnodmass))
+meta$tot.Nfixd.gplant <- with(meta, ((Nfixd*totnodmass)/totmass))
+meta$tot.Nfixd.gplant[is.na(meta$tot.Nfixd.gplant)] = 0
+meta$nodal = with(meta, (totnodmass/totmass))
+
+#Once all the variables are added to the meta dataframe
+#we need to change the column name to be the rowname so that phyloseq can match it to the OTU_table
+meta1 = meta %>%
+  column_to_rownames(var = "JV.num")
+meta$JV.num= sapply(strsplit(meta$JV.num, split='.', fixed=TRUE), function(x) (x[1]))
+meta2 = meta %>%
+  column_to_rownames(var = "JV.num")
+META = sample_data(meta1)
+META2 = sample_data(meta2)
+
+
+```
+
+
+##Making 16S phyloseq objects
+```{r}
+#Load in phyloseq objects before any clustering or filtering
+ps16s = qza_to_phyloseq(features="/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/16s.qza",    taxonomy="/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/16s_taxonomy.qza",metadata = "/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/16s_meta_data.txt", tree = "/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/16tree.qza")
+ps16s = merge_phyloseq(ps16s,META)
+
+#Filtering to just bacteria and no mitrochondria or chlorplast
+#vignette("phyloseq-basics")
+
+filKing = "Bacteria"
+topFamilies <- tax_table(ps16s)[, "Order"]
+ps16s_ = subset_taxa(ps16s, Kingdom == "Bacteria")
+ps16s_ = subset_taxa(ps16s_, Order != "Mitochondria")
+ps16s_ = subset_taxa(ps16s_, Family != "Mitochondria")
+ps16s_ = subset_taxa(ps16s_, Order != "Chloroplast")
+ps16s_f <- prune_samples(sample_sums(ps16s_)>=1000, ps16s_)
+
+#rarifying the data to equal depths
+ps16s_fr= rarefy_even_depth(ps16s_f, rngseed=13, sample.size = min(sample_sums(ps16s_f)))
+
+#use this instead of reruning the code once I do it
+saveRDS(ps16s_fr,"ps16s_fr.rds")
+#Then always call it this way:
+readRDS("ps16s_fr.rds")
+
+```
+
+
+##Making nifH phyloseq objects
+```{r}
+psnif<-qza_to_phyloseq(features="/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/niff_env.qza",taxonomy="/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/niff_env_taxonomy.qza",metadata = "/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/niff_meta_table.txt", tree = "/Users/lindsaymcculloch/Google Drive/Brown/Research/LaSelva_Rhizobia/Chapter4/qiime_data/ntree.qza")
+psnif = merge_phyloseq(psnif,META2)
+psnif_ = subset_taxa(psnif, Class == "Betaproteobacteria" | Class == "Alphaproteobacteria" | Order != "NA")
+psnif_f <- prune_samples(sample_sums(psnif_)>=1000, psnif_)
+
+#rarifying the data to equal depths
+psnif_fr= rarefy_even_depth(psnif_f, rngseed=13, sample.size = min(sample_sums(psnif_f)))
+
+#use this instead of reruning the code once I do it
+saveRDS(psnif_fr,"psnif_fr.rds")
+#Then always call it this way:
+readRDS("psnif_fr.rds")
+
+```
+
+
+#Calculating frequency of occurance (FOO) and Relative Read Abundance (RRA) for 16S
+```{r}
+#Subsetting the rarified 16S phyloseq object into each legume species
+ps16s.P = subset_samples(ps16s_fr, S.num == "P.mac")
+ps16s.S = subset_samples(ps16s_fr, S.num == "S.mic")
+ps16s.Z = subset_samples(ps16s_fr, S.num == "Z.lon")
+
+presence16S <- apply(otu_table(ps16s.P), 1, function(x) d(x, q=0))
+
+FOO16S_P =  presence16S/30   
+FOO16S_P =  as.data.frame(FOO16S_P)
+
+presence16S <- apply(otu_table(ps16s.S), 1, function(x) d(x, q=0))
+
+FOO16S_S =  presence16S/27   
+FOO16S_S =  as.data.frame(FOO16S_S)
+FOO16S_S$ESV = row.names(FOO16S_S)
+
+presence16Z <- apply(otu_table(ps16s.Z), 1, function(x) d(x, q=0))
+
+FOO16S_Z =  presence16Z/33   
+FOO16S_Z =  as.data.frame(FOO16S_Z)
+FOO16S_Z$ESV = row.names(FOO16S_Z)
+
+#Here I'm trying to calculate to portion of nodules that an ESV occurred 
+
+
+RRA_16SP<- transform_sample_counts(ps16s.P, function(x) x/sum(x))
+RRA_16SS <- transform_sample_counts(ps16s.S, function(x) x/sum(x))
+RRA_16SZ<- transform_sample_counts(ps16s.Z, function(x) x/sum(x))
+
+dd_rra_otuP <- as.data.frame(t(otu_table(RRA_16SP)))
+mean(dd_rra_otuP$ESV_015967)*100
+
+mean(dd_rra_otuP$ESV_016099)*100
+
+dd_rra_otuS <- as.data.frame(t(otu_table(RRA_16SS)))
+mean(dd_rra_otuS$ESV_015966)*100
+
+mean(dd_rra_otuS$ESV_000035)*100
+mean(dd_rra_otuS$ESV_000051)*100
+
+dd_rra_otuZ <- as.data.frame(t(otu_table(RRA_16SZ)))
+mean(dd_rra_otuZ$ESV_015966)*100
+
+mean(dd_rra_otuZ$ESV_009175)*100
+mean(dd_rra_otuZ$ESV_001048)*100
+mean(dd_rra_otuZ$ESV_001873)*100
+mean(dd_rra_otuZ$ESV_000035)*100
+mean(dd_rra_otuZ$ESV_015981)*100
+mean(dd_rra_otuZ$ESV_015970)*100
+mean(dd_rra_otuZ$ESV_004879)*100
+
+```
+
+#Calculating frequency of occurance (FOO) and Relative Read Abundance (RRA) for nifH
+```{r}
+#Subsetting the rarified 16S phyloseq object into each legume species
+psnif.P = subset_samples(psnif_fr, S.num == "P.mac")
+psnif.S = subset_samples(psnif_fr, S.num == "S.mic")
+psnif.Z = subset_samples(psnif_fr, S.num == "Z.lon")
+
+presencenif <- apply(otu_table(psnif.P), 1, function(x) d(x, q=0))
+
+FOOnif_P =  presencenif/28   
+FOOnif_P =  as.data.frame(FOOnif_P)
+FOOnif_P
+
+presencenif <- apply(otu_table(psnif.S), 1, function(x) d(x, q=0))
+
+FOOnif_S =  presencenif/25   
+FOOnif_S =  as.data.frame(FOOnif_S)
+FOOnif_S$ESV = row.names(FOOnif_S)
+
+presencenif <- apply(otu_table(psnif.Z), 1, function(x) d(x, q=0))
+
+FOOnif_Z =  presencenif/30   
+FOOnif_Z =  as.data.frame(FOOnif_Z)
+FOOnif_Z$ESV = row.names(FOOnif_Z)
+
+#Here I'm trying to calculate to portion of nodules that an ESV occurred 
+
+
+RRA_nifP<- transform_sample_counts(psnif.P, function(x) x/sum(x))
+RRA_nifS<- transform_sample_counts(psnif.S, function(x) x/sum(x))
+RRA_nifZ<- transform_sample_counts(psnif.Z, function(x) x/sum(x))
+
+dd_rra_otuP <- as.data.frame(t(otu_table(RRA_nifP)))
+mean(dd_rra_otuP$ESV_000001)*100
+
+
+dd_rra_otuS <- as.data.frame(t(otu_table(RRA_nifS)))
+mean(dd_rra_otuS$ESV_000014)*100
+mean(dd_rra_otuS$ESV_000021)*100
+
+
+dd_rra_otuZ <- as.data.frame(t(otu_table(RRA_nifZ)))
+mean(dd_rra_otuZ$ESV_000011)*100
+mean(dd_rra_otuZ$ESV_000008)*100
+
+```
+
+
+
+#Multivariate comparisons of microbial community composition for 16s
+```{r}
+otu16s <- abundances(ps16s_fr)
+meta16s <- meta(ps16s_fr)
+meta16s$light = as.factor(meta16s$light)
+meta16s$S.num = as.factor(meta16s$S.num)
+meta16s$nitro = as.factor(meta16s$nitro)
+
+permanova16s <- adonis(t(otu16s) ~ S.num,
+               data = meta16s, method = "bray")
+permanova16s
+dist16s <- vegdist(t(otu16s), method = "bray")
+test = adonis_pairwise(meta16s, dist16s, "S.num")
+test$Adonis.tab
+
+otu16sP <- abundances(ps16s_P)
+meta16sP <- meta(ps16s_P)
+permanova16sP <- adonis(t(otu16sP) ~ type*nitro,
+               data = meta16sP, method = "bray")
+permanova16sP
+
+otu16sZ <- abundances(ps16s_Z)
+meta16sZ <- meta(ps16s_Z)
+permanova16sZ <- adonis(t(otu16sZ) ~ type*nitro,
+               data = meta16sZ, method = "bray")
+permanova16sZ
+
+otu16sS <- abundances(ps16s_S)
+meta16sS <- meta(ps16s_S)
+permanova16sS <- adonis(t(otu16sS) ~ type*nitro,
+               data = meta16sS, method = "bray")
+permanova16sS
+```
+
+
+
+```{r}
+#NIFH
+ps_tmpN <- fantaxtic::get_top_taxa(physeq_obj = psnif_fr, n = 30, relative = TRUE,
+                       discard_other = FALSE, other_label = "Other")
+ps_tmpN <- fantaxtic::name_taxa(ps_tmpN, label = "Unknown", species = T, other_label = "Other")
+ps_tmpN <- microbiome::transform(ps_tmpN, "compositional")
+
+#Create labels for missing taxonomic ranks
+
+
+fantaxtic::fantaxtic_bar(ps_tmpN, color_by = "Genus", label_by = "Genus", other_label = "Other",  facet_by = "S.num")
+
+nb.cols <- 5
+mycolors <- colorRampPalette(brewer.pal(8, "Dark2"))(nb.cols)
+mycolors <- c("#1B9E77", "grey")
+sample_data(ps_tmpN)$S.num <- factor(sample_data(ps_tmpN)$S.num, levels = c("P.mac", "S.mic", "Z.lon"))
+supp.labs <- c("P. macroloba", "S. microstachyum", "Z. longifolia")
+names(supp.labs) = c("P.mac", "S.mic", "Z.lon")
+plot_cN = plot_bar(ps_tmpN, fill = "Genus")+ facet_wrap(~S.num, scales="free_x", nrow=1, labeller = labeller(S.num = supp.labs))+
+  ylab("Relative Abundance (%)")+
+      theme_pubr()+
+   theme(strip.text.x = element_text(face = "italic", size = 18))+
+    theme(text=element_text(size=18),axis.text.x=element_text(size=12, colour="black", angle = 90))+
+    scale_fill_manual(values = mycolors)+theme(legend.position = "bottom")
+plot_cN
+```
+
+
+
+#Indicator species analysis
+```{r}
+library(indicspecies)
+
+md16s = meta(ps16s_fr)
+md16s$rank = "low"
+md16s$rank[md16s$Nfixd > 0.0275] = "high"
+m16s = md16s[,c(1,33,75)]
+colnames(m16s) = c("plant","sp", "rank")
+rank = m16s$rank
+a_ <- cbind(rownames(a), data.frame(a, row.names=NULL))
+colnames(a_)[1] = "plant"
+pc16s = inner_join(m16s,a_, by ="plant")
+
+inv_16s = multipatt(a, rank, func = "r.g", control = how(nperm=999))
+summary(inv_16s)
+
+sub_pc16 = data.frame(Rank = pc16s$rank,ESV_015967 = pc16s$ESV_015967, ESV_016004 = pc16s$ESV_016004, ESV_015974 = pc16s$ESV_015974, ESV_000035 = pc16s$ESV_000035 , ESV_015981 = pc16s$ESV_015981 , ESV_015970 = pc16s$ESV_015970,
+                      ESV_000122 = pc16s$ESV_000122, ESV_001048 = pc16s$ESV_001048, ESV_016055 = pc16s$ESV_016055,
+                      ESV_005019 = pc16s$ESV_005019)
+
+sub_pc16_m = melt(sub_pc16, id = "Rank")
+
+is_16s = ggplot(sub_pc16_m, aes(x = variable, y = value, fill = Rank)) + 
+     geom_boxplot(colour = "black") +
+     geom_vline(xintercept = c(1.5, 2.5,3.5,4.5,5.5,6.5,7.5,8.5,9.5), colour = "grey85", size = 1.2) +
+     theme(legend.title = element_text(size = 12, face = "bold"), 
+     legend.text = element_text(size = 10, face = "bold"), legend.position = "right", 
+     axis.text.x = element_text(face = "bold",colour = "black", size = 12, angle = 45, hjust = 1), 
+     axis.text.y = element_text(face = "bold", size = 12, colour = "black"), 
+     axis.title.y = element_text(face = "bold", size = 14, colour = "black"), 
+     panel.background = element_blank(), 
+     panel.border = element_rect(fill = NA, colour = "black"), 
+     legend.key=element_blank()) + 
+     labs(x= "", y = "Relative Abundance (%)", fill = "Rank") + 
+     scale_fill_manual(values = c("steelblue2", "steelblue4"))
+
+
+
+mdN = meta(psnif_fr)
+mdN$rank = "low"
+mdN$rank[mdN$Nfixd > 0.10863] = "high"
+mN = mdN[,c(1,34,75)]
+colnames(mN) = c("plant","sp", "rank")
+rankN = mN$rank
+b_ <- cbind(rownames(b), data.frame(b, row.names=NULL))
+colnames(b_)[1] = "plant"
+pcnif = inner_join(mN,b_, by ="plant")
+
+
+inv_nifH = multipatt(b, rankN, func = "r.g", control = how(nperm=999))
+summary(inv_nifH)
+
+
+sub_pcnif = data.frame(Rank = pcnif$rank,ESV_000011 = pcnif$ESV_000011, ESV_000008 = pcnif$ESV_000008)
+
+sub_pcnif_m = melt(sub_pcnif, id = "Rank")
+
+is_nif = ggplot(sub_pcnif_m, aes(x = variable, y = value, fill = Rank)) + 
+     geom_boxplot(colour = "black") +
+     geom_vline(xintercept = (1.5), colour = "grey85", size = 1.2) +
+     theme(legend.title = element_text(size = 12, face = "bold"), 
+     legend.text = element_text(size = 10, face = "bold"), legend.position = "right", 
+     axis.text.x = element_text(face = "bold",colour = "black", size = 12), 
+     axis.text.y = element_text(face = "bold", size = 12, colour = "black"), 
+     axis.title.y = element_text(face = "bold", size = 14, colour = "black"), 
+     panel.background = element_blank(), 
+     panel.border = element_rect(fill = NA, colour = "black"), 
+     legend.key=element_blank()) + 
+     labs(x= "", y = "Relative Abundance (%)", fill = "Rank") + 
+     scale_fill_manual(values = c("steelblue2", "steelblue4"))
+
+```
+
+
+##Indicator species analysis BY SPECIES 16S
+```{r}
+library(indicspecies)
+ps16s.P = subset_samples(ps16s_fr, S.num == "P.mac")
+ps16s.S = subset_samples(ps16s_fr, S.num == "S.mic")
+ps16s.Z = subset_samples(ps16s_fr, S.num == "Z.lon")
+
+md16s_P = meta(ps16s.P)
+md16s_P$rank = "low"
+md16s_P$rank[md16s_P$Nfixd > 0.1314221] = "high"
+m16s_P = md16s_P[,c(1,33,75)]
+colnames(m16s_P) = c("plant","sp", "rank")
+rank = m16s_P$rank
+
+inv_16sP = multipatt(aP, rank, func = "r.g", control = how(nperm=999))
+summary(inv_16sP)
+
+md16s_S = meta(ps16s.S)
+md16s_S$rank = "low"
+md16s_S$rank[md16s_S$Nfixd > 0.05721239] = "high"
+m16s_S = md16s_S[,c(1,33,75)]
+colnames(m16s_S) = c("plant","sp", "rank")
+rank = m16s_S$rank
+
+inv_16sS = multipatt(aS, rank, func = "r.g", control = how(nperm=999))
+summary(inv_16sS)
+
+
+md16s_Z = meta(ps16s.Z)
+md16s_Z$rank = "low"
+md16s_Z$rank[md16s_Z$Nfixd > 0.1131634] = "high"
+m16s_Z = md16s_Z[,c(1,33,75)]
+colnames(m16s_Z) = c("plant","sp", "rank")
+rank = m16s_Z$rank
+
+inv_16sZ = multipatt(aZ, rank, func = "r.g", control = how(nperm=999))
+summary(inv_16sZ)
+
+```
+
+##Indicator species analysis BY SPECIES nifH
+```{r}
+library(indicspecies)
+psnif.P = subset_samples(psnif_fr, S.num == "P.mac")
+psnif.S = subset_samples(psnif_fr, S.num == "S.mic")
+psnif.Z = subset_samples(psnif_fr, S.num == "Z.lon")
+
+mdnif_P = meta(psnif.P)
+mdnif_P$rank = "low"
+mdnif_P$rank[mdnif_P$Nfixd > 0.1314221] = "high"
+mnif_P = mdnif_P[,c(1,33,75)]
+colnames(mnif_P) = c("plant","sp", "rank")
+rank = mnif_P$rank
+
+inv_nifP = multipatt(bP, rank, func = "r.g", control = how(nperm=999))
+summary(inv_nifP)
+
+mdnif_S = meta(psnif.S)
+mdnif_S$rank = "low"
+mdnif_S$rank[mdnif_S$Nfixd > 0.05721239] = "high"
+mnif_S = mdnif_S[,c(1,33,75)]
+colnames(mnif_S) = c("plant","sp", "rank")
+rank = mnif_S$rank
+
+inv_nifS = multipatt(bS, rank, func = "r.g", control = how(nperm=999))
+summary(inv_nifS)
+
+
+mdnif_Z = meta(psnif.Z)
+mdnif_Z$rank = "low"
+mdnif_Z$rank[mdnif_Z$Nfixd > 0.1131634] = "high"
+mnif_Z = mdnif_Z[,c(1,33,75)]
+colnames(mnif_Z) = c("plant","sp", "rank")
+rank = mnif_Z$rank
+
+inv_nifZ = multipatt(bZ, rank, func = "r.g", control = how(nperm=999))
+summary(inv_nifZ)
+
+```
+
+##Alpha Diversity for 16S
+```{r}
+rich.16s = ps16s_fr %>%
+  plot_richness(
+    x = "S.num",
+    measures = c("Observed", "Shannon", "InvSimpson"))+
+  geom_violin(aes(fill=S.num), show.legend = FALSE)+
+  geom_boxplot(width = 0.1) +
+  theme_classic () +
+  xlab(NULL) +
+  theme(axis.text.y.left = element_text(size = 20),
+        axis.text.x = element_text(size = 20, hjust = 0.5, vjust = .5, angle = 45),
+        axis.title.y = element_text(size = 20))+ 
+  theme(strip.text = element_text(face = "bold", size = 25))+
+  ggtitle("Alpha Diversity 16S") +                                     
+  theme(plot.title=element_text(size = 25, face = "bold", hjust = 0.5))
+
+rich.16s.type = ps16s_f %>%
+  plot_richness(
+    x = "type",
+    measures = c("Shannon"))+
+  geom_violin(aes(fill=type), show.legend = FALSE)+
+  geom_boxplot(width = 0.1) +
+  theme_classic () +
+  xlab(NULL) +
+  theme(axis.text.y.left = element_text(size = 20),
+        axis.text.x = element_text(size = 20, hjust = 0.5, vjust = .5, angle = 45),
+        axis.title.y = element_text(size = 20))+ 
+  theme(strip.text = element_text(face = "bold", size = 25))+
+  ggtitle("Alpha Diversity 16S") +                                     
+  theme(plot.title=element_text(size = 25, face = "bold", hjust = 0.5))
+
+rich.16s
+rich.16s.type
+
+#Making the data behind this graphic into a data frame to run analysis
+obs = rich.16s$data
+
+#Filtering so the dataframe just has richness data
+stat.ob = obs %>%
+  filter(variable == "Observed")
+#Checking normality
+shapiro.test(stat.ob$value) #Not normal
+#Significant differences found in richness
+wilcox.test(stat.ob$value ~ stat.ob$type) #P= 0.0001355
+kruskal.test(stat.ob$value ~ stat.ob$S.num) #P = 0.01154
+pairwise.wilcox.test(stat.ob$value, stat.ob$S.num, p.adjust.method="BH")
+#P.mac&S.mic(0.00064),Z.lon&S.mic(0.1385),P.mac&Z.lon(0.2389)
+
+#write.csv(stat.ob, file = "export.richness.16s.csv")
+
+#Filtering so the dataframe just has Shannon Index data
+stat.sh = obs %>%
+  filter(variable == "Shannon")
+#Checking normality
+shapiro.test(stat.sh$value) #Not normal
+#Significant differences found in shannon index
+wilcox.test(stat.sh$value ~ stat.sh$type) #p-value = 0.001987
+wilcox.test(stat.sh$value ~ stat.sh$nitro) #p-value =  0.5301
+kruskal.test(stat.sh$value ~ stat.sh$light) #p-value = 0.008228  signficant difference between 0 and 1 and 0 and 2
+pairwise.wilcox.test(stat.sh$value, stat.sh$light, p.adjust.method="BH")
+kruskal.test(stat.sh$value ~ stat.sh$S.num) #p-value = 0.005357
+pairwise.wilcox.test(stat.sh$value, stat.sh$S.num, p.adjust.method="BH")
+#P.mac&S.mic(0.0028),Z.lon&S.mic(0.1836),P.mac&Z.lon(0.0929)
+
+write.csv(stat.sh, file = "export.shannon.16s.csv")
+
+#Filtering so the data frame just has Inverse Simpson index
+stat.isim = obs %>%
+  filter(variable == "InvSimpson")
+#Checking normality
+shapiro.test(stat.isim$value) #Not normal
+#Significant differences found in inv. simpson
+wilcox.test(stat.isim$value ~ stat.isim$type) #p-value = 0.004379
+kruskal.test(stat.isim$value ~ stat.isim$S.num) #p-value = 0.006092
+pairwise.wilcox.test(stat.isim$value, stat.isim$S.num, p.adjust.method="BH")
+#P.mac&S.mic (0.0036),Z.lon&S.mic(0.2259),P.mac&Z.lon (0.0717)
+
+#write.csv(stat.isim, file = "export.simpson.16s.csv")
+```
+
+##Alpha Diversity for nifH
+```{r}
+rich.nif = psnif_f %>%
+  plot_richness(
+    x = "S.num",
+    measures = c("Observed", "Shannon", "InvSimpson"))+
+  geom_violin(aes(fill=S.num), show.legend = FALSE)+
+  geom_boxplot(width = 0.1) +
+  theme_classic () +
+  xlab(NULL) +
+  theme(axis.text.y.left = element_text(size = 20),
+        axis.text.x = element_text(size = 20, hjust = 0.5, vjust = .5, angle = 45),
+        axis.title.y = element_text(size = 20))+ 
+  theme(strip.text = element_text(face = "bold", size = 25))+
+  ggtitle("Alpha Diversity nifH") +                                     
+  theme(plot.title=element_text(size = 25, face = "bold", hjust = 0.5))
+
+rich.nif.type = psnif_f %>%
+  plot_richness(
+    x = "type",
+    measures = c("Observed", "Shannon", "InvSimpson"))+
+  geom_violin(aes(fill=type), show.legend = FALSE)+
+  geom_boxplot(width = 0.1) +
+  theme_classic () +
+  xlab(NULL) +
+  theme(axis.text.y.left = element_text(size = 20),
+        axis.text.x = element_text(size = 20, hjust = 0.5, vjust = .5, angle = 45),
+        axis.title.y = element_text(size = 20))+ 
+  theme(strip.text = element_text(face = "bold", size = 25))+
+  ggtitle("Alpha Diversity nifH") +                                     
+  theme(plot.title=element_text(size = 25, face = "bold", hjust = 0.5))
+
+rich.nif
+rich.nif.type
+
+#Making the data behind this graphic into a data frame to run analysis
+obs = rich.nif$data
+
+#Filtering so the dataframe just has richness data
+stat.ob = obs %>%
+  filter(variable == "Observed")
+#Checking normality
+shapiro.test(stat.ob$value) #Not normal
+#No significant difference found in richness
+kruskal.test(stat.ob$value ~ stat.ob$type) #P= 0.2175
+kruskal.test(stat.ob$value ~ stat.ob$S.num) #P = 0.1407
+
+#write.csv(stat.ob, file = "export.richness.nifH.csv")
+
+#Filtering so the dataframe just has Shannon Index data
+stat.sh = obs %>%
+  filter(variable == "Shannon")
+#Checking normality
+shapiro.test(stat.sh$value) #Not normal
+#No significant difference found in shannon index
+kruskal.test(stat.sh$value ~ stat.sh$type) #p-value = 0.2063
+kruskal.test(stat.sh$value ~ stat.sh$nitro) #p-value = 0.3615
+kruskal.test(stat.sh$value ~ stat.sh$light) #p-value =0.2476
+kruskal.test(stat.sh$value ~ stat.sh$S.num) #p-value =0.04075
+pairwise.wilcox.test(stat.sh$value, stat.sh$S.num, p.adjust.method="BH")
+#P.mac&S.mic(0.101),Z.lon&S.mic(0.028),P.mac&Z.lon(0.450)
+
+#write.csv(stat.sh, file = "export.shannon.nifH.csv")
+
+#Filtering so the data frame just has Inverse Simpson index
+stat.isim = obs %>%
+  filter(variable == "InvSimpson")
+#Checking normality
+shapiro.test(stat.isim$value) #Not normal
+#No significant difference found in inv. simpson
+kruskal.test(stat.isim$value ~ stat.isim$type) #p-value = 0.1394
+kruskal.test(stat.isim$value ~ stat.isim$S.num) #p-value = 0.01405
+pairwise.wilcox.test(stat.isim$value, stat.isim$S.num, p.adjust.method="BH")
+#P.mac&S.mic (0.058),Z.lon&S.mic(0.013),P.mac&Z.lon (0.489)
+
+#write.csv(stat.isim, file = "export.simpson.nifH.csv")
+```
+
+#Figure 1
+```{r}
+if(!"devtools" %in% installed.packages()){
+  install.packages("devtools", dependencies = T, )
+}
+
+devtools::install_github("gmteunisse/Fantaxtic")
+library(fantaxtic)
+#16S
+ps_tmp <- fantaxtic::get_top_taxa(physeq_obj = ps16s_fr, n = 10, relative = TRUE,
+                       discard_other = FALSE, other_label = "Other")
+ps_tmp <- fantaxtic::name_taxa(ps_tmp, label = "Unknown", species = T, other_label = "Other")
+ps_tmp <- microbiome::transform(ps_tmp, "compositional")
+
+
+
+mycolors <- c("#ffffcc","#57be7a","#deebf7","#225ea8", "#41b6c4")
+sample_data(ps_tmp)$S.num <- factor(sample_data(ps_tmp)$S.num, levels = c("P.mac", "Z.lon", "S.mic"))
+supp.labs <- c("P. macroloba", "Z. longifolia", "S. microstachyum")
+names(supp.labs) = c("P.mac", "Z.lon", "S.mic")
+plot_a = plot_bar(ps_tmp, fill = "Order")+ facet_wrap(~S.num, scales="free_x", nrow=1, labeller = labeller(S.num = supp.labs))+
+  ylab("Relative Abundance (%)")+
+      theme_pubr()+
+   theme(strip.text.x = element_text(face = "italic", size = 15))+
+    theme(text=element_text(size=15),axis.text.x=element_text(size=12, colour="black", angle = 90))+
+    scale_fill_manual(values = mycolors)+theme(legend.position = "bottom")
+
+#NIFH panel
+ps_tmpN <- fantaxtic::get_top_taxa(physeq_obj = psnif_fr, n = 30, relative = TRUE,
+                       discard_other = FALSE, other_label = "Other")
+ps_tmpN <- fantaxtic::name_taxa(ps_tmpN, label = "Unknown", species = T, other_label = "Other")
+ps_tmpN <- microbiome::transform(ps_tmpN, "compositional")
+
+#Create labels for missing taxonomic ranks
+
+
+mycolors <- c("#41b6c4", "grey")
+sample_data(ps_tmp)$S.num <- factor(sample_data(ps_tmp)$S.num, levels = c("P.mac", "Z.lon", "S.mic"))
+supp.labs <- c("P. macroloba", "Z. longifolia", "S. microstachyum")
+names(supp.labs) = c("P.mac", "Z.lon", "S.mic")
+plot_c = plot_bar(ps_tmpN, fill = "Genus")+ facet_wrap(~S.num, scales="free_x", nrow=1, labeller = labeller(S.num = supp.labs))+
+  ylab("Relative Abundance (%)")+
+      theme_pubr()+
+   theme(strip.text.x = element_text(face = "italic", size = 15))+
+    theme(text=element_text(size=15),axis.text.x=element_text(size=12, colour="black", angle = 90))+
+    scale_fill_manual(values = mycolors)+theme(legend.position = "bottom")
+plot_c
+
+#removing all the rhizobia for 16S
+ps16s.P = subset_samples(ps16s_fr, S.num == "P.mac")
+ps_tmp2 <- fantaxtic::get_top_taxa(physeq_obj = ps16s, n = 30, relative = TRUE,
+                       discard_other = FALSE, other_label = "Other")
+ps_tmp22<- transform_sample_counts(ps_tmp2, function(x) x/sum(x))
+ps_tmp222 = subset_taxa(ps_tmp22, Order != "Rhizobiales")
+#Calculating the non-rhizobia relative abundance for P.mac
+df_pstmp22 <- as.data.frame(t(otu_table(ps_tmp222)))
+df_pstmp22$total = rowSums(df_pstmp22[,1:24])
+mean(df_pstmp22$total)
+sd(df_pstmp22$total)
+max(df_pstmp22$total)
+
+#ps16s_frN = subset_taxa(ps_tmp2, Order != "Rhizobiales")
+rich.16s1 = ps_tmp2 %>%
+  plot_richness(
+    x = "S.num", 
+    measures = "Shannon")+
+  geom_boxplot(fill = "grey75")+
+  theme_classic () +
+  xlab(NULL) +
+  ylab("Shannon Diversity Index")+
+  theme(axis.text.y.left = element_text(size = 15),
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = .5, angle = 45),
+        axis.title.y = element_text(size = 15))+ 
+  theme(strip.text = element_blank())+
+  scale_x_discrete(labels=c("P.mac" = "P. macroloba",
+                            "Z.lon" = "Z. longifolia", "S.mic" = "S. microstachyum"))+
+  theme(plot.title = element_text(hjust = 0.5, vjust =  2, size = 25, face = "bold"))
+rich.16s1
+
+#Making the data behind this graphic into a data frame to run analysis
+shan16S_R =rich.16s1$data
+
+#Filtering so the dataframe just has Shannon Index data
+stat.sh16S_R = shan16S_R[c("S.num", "samples", "value")]
+kruskal.test(stat.sh16S_R$value~stat.sh16S_R$S.num)
+library(rstatix)
+wilcox_test(value ~ S.num, data=stat.sh16S_R, p.adjust.method="bonferroni")
+hist(stat.sh16S_R$value)
+
+
+#removing all the rhizobia for nifH
+nif_tmp2 <- fantaxtic::get_top_taxa(physeq_obj = psnif_fr, n = 30, relative = TRUE,
+                       discard_other = FALSE, other_label = "Other")
+rich.nif = nif_tmp2 %>%
+  plot_richness(
+    x = "S.num",
+    measures = "Shannon")+
+  geom_boxplot(fill = "grey75") +
+  theme_classic () +
+  xlab(NULL) +
+  ylab("Shannon Diversity Index")+
+  theme(axis.text.y.left = element_text(size = 15),
+        axis.text.x = element_text(size = 15, hjust = 0.5, vjust = .5, angle = 45),
+        axis.title.y = element_text(size = 15))+ 
+  theme(strip.text = element_blank())+
+  scale_x_discrete(labels=c("P.mac" = "P. macroloba","S.mic" = "S. microstachyum",
+                            "Z.lon" = "Z. longifolia"))+
+  theme(plot.title = element_text(hjust = 0.5, vjust =  2, size = 25, face = "bold"))
+rich.nif
+
+#Making the data behind this graphic into a data frame to run analysis
+shannif_R =rich.nif$data
+
+#Filtering so the dataframe just has Shannon Index data
+shannif_R= shannif_R[c("S.num", "samples", "value")]
+kruskal.test(shannif_R$value~shannif_R$S.num)
+
+
+fig1 = ggarrange(plot_a, rich.16s1,plot_c,rich.nif,
+                 labels = c("A", "B", "C", "D"),
+                 ncol = 2, nrow =2,
+                 widths = c(1.5,.5))
+fig1
+
+fig1 = ggsave("figure1_52522.jpeg", width = 15, height = 10, units = "in")
+
+
+```
+#Figure 2
+```{r}
+#devtools::install_github("david-barnett/microViz@0.9.1")
+library("microViz")
+metadata16s = meta(ps16s_fr)
+
+
+GP.ord <- ordinate(ps16s_fr, "NMDS", "bray")
+p1 = plot_ordination(ps16s_fr, GP.ord, type="sample", color="S.num", title = "")+
+  geom_point(size=3)+
+  scale_color_manual(labels = c("P. macroloba", "Z. longifolia", "S. microstachyum"),
+                     values = c("#016c59", "#67a9cf","#bdc9e1"))+
+     theme(legend.title = element_text(size = 15, face = "bold"), 
+     legend.text = element_text(size = 15, face = "italic"), legend.position = "none", 
+     axis.text.x = element_text(face = "bold",colour = "black", size = 12), 
+     axis.text.y = element_text(face = "bold", size = 15, colour = "black"), 
+     axis.title = element_text(face = "bold", size = 15, colour = "black"), 
+     axis.title.y = element_text(face = "bold", size = 15, colour = "black"), 
+     panel.background = element_blank(),
+     panel.border = element_rect(fill = NA, colour = "black"),
+     legend.key=element_blank())+
+    guides(color=guide_legend(title="Host species"))
+p1
+
+
+GP.ordNF <- ordinate(psnif_fr, "NMDS", "bray")
+scores(GP.ordNF)
+p2 = plot_ordination(psnif_fr, GP.ordNF, type="sample", color="S.num", title = "nifH")+
+     geom_point(size=3)+
+     theme(legend.title = element_text(size = 12, face = "bold"), 
+     legend.text = element_text(size = 10, face = "italics"), legend.position = "none", 
+     axis.text.x = element_text(face = "bold",colour = "black", size = 12), 
+     axis.text.y = element_text(face = "bold", size = 12, colour = "black"), 
+     axis.title = element_text(face = "bold", size = 15, colour = "black"), 
+     axis.title.y = element_text(face = "bold", size = 15, colour = "black"), 
+     panel.background = element_blank(),
+     panel.border = element_rect(fill = NA, colour = "black"))
+
+#without outlier S025721 
+psnif_fr2 = subset_samples(psnif_fr, P.num != "527")
+GP.ordNF2 <- ordinate(psnif_fr2, "NMDS", "bray")
+scores(GP.ordNF)
+p3 = plot_ordination(psnif_fr2, GP.ordNF2, type="sample", color="S.num", title = "")+
+   geom_point(size=3)+
+  scale_color_manual(labels = c("P. macroloba", "Z. longifolia", "S. microstachyum"),
+                     values = c("#016c59", "#67a9cf","#bdc9e1"))+
+     theme(legend.title = element_text(size = 15, face = "bold"), 
+     legend.text = element_text(size = 15, face = "italic"), legend.position = "right", 
+     axis.text.x = element_text(face = "bold",colour = "black", size = 12), 
+     axis.text.y = element_text(face = "bold", size = 15, colour = "black"), 
+     axis.title = element_text(face = "bold", size = 15, colour = "black"), 
+     axis.title.y = element_text(face = "bold", size = 15, colour = "black"), 
+     panel.background = element_blank(),
+     panel.border = element_rect(fill = NA, colour = "black"),
+     legend.key=element_blank())+
+    guides(color=guide_legend(title="Host species"))
+
+p1
+p2
+p3
+
+figORD = ggarrange(p1, p3,
+                 labels = c("A", "B"),
+                 ncol = 2, nrow =1, 
+                 widths = c(.75,1))
+figORD
+
+figORD = ggsave("figureORD_60822.jpeg", width = 14, height = 8, units = "in")
+
+
+#perMANOVA analysis 16S:
+otu16s <- abundances(ps16s_fr)
+meta16s <- meta(ps16s_fr)
+meta16s$light = as.factor(meta16s$light)
+meta16s$S.num = as.factor(meta16s$S.num)
+meta16s$nitro = as.factor(meta16s$nitro)
+
+permanova16s <- adonis(t(otu16s) ~ S.num*type*nitro,
+               data = meta16s, method = "bray")
+permanova16s
+dist16s <- vegdist(t(otu16s), method = "bray")
+test = adonis_pairwise(meta16s, dist16s, "S.num")
+test
+
+
+print(permanova16s)
+
+#running nifH without S025721 outlier 
+otunif <- abundances(psnif_fr)
+otunif2 = subset(otunif, select = -c(S025721))
+metanif <- meta(psnif_fr)
+
+metanif$light = as.factor(metanif$light)
+metanif$S.num = as.factor(metanif$S.num)
+metanif$nitro = as.factor(metanif$nitro)
+metanif2 = metanif[metanif$BLANK.3.1 != "S025721",]
+
+permanovanif <- adonis2(t(otunif) ~ S.num,
+               data = metanif, method = "bray")
+permanovanif
+
+permanovanif2 <- adonis2(t(otunif2) ~ S.num,
+               data = metanif2, method = "bray")
+permanovanif2
+
+distnif <- vegdist(t(otunif), method = "bray")
+pair.nif = adonis_pairwise(metanif, distnif, "S.num")
+pair.nif
+
+```
+#Figure 3
+```{r}
+library(indicspecies)
+ps16s.P = subset_samples(ps16s_fr, S.num == "P.mac")
+ps16s.S = subset_samples(ps16s_fr, S.num == "S.mic")
+ps16s.Z = subset_samples(ps16s_fr, S.num == "Z.lon")
+
+md16s_P = meta(ps16s.P)
+md16s_P$rank = "low"
+md16s_P$rank[md16s_P$Nfixd > 0.1314221] = "high"
+m16s_P = md16s_P[,c(1,33:75)]
+colnames(m16s_P) = c("plant","sp", "rank")
+rank = m16s_P$rank
+
+inv_16sP = multipatt(aP, rank, func = "r.g", control = how(nperm=999))
+summary(inv_16sP)
+
+md16s_S = meta(ps16s.S)
+md16s_S$rank = "low"
+md16s_S$rank[md16s_S$Nfixd > 0.05721239] = "high"
+m16s_S = md16s_S[,c(1,33,75)]
+colnames(m16s_S) = c("plant","sp", "rank")
+rank = m16s_S$rank
+
+inv_16sS = multipatt(aS, rank, func = "r.g", control = how(nperm=999))
+summary(inv_16sS)
+
+
+md16s_Z = meta(ps16s.Z)
+md16s_Z$rank = "low"
+md16s_Z$rank[md16s_Z$Nfixd > 0.1131634] = "high"
+m16s_Z = md16s_Z[,c(1,33,75)]
+colnames(m16s_Z) = c("plant","sp", "rank")
+rank = m16s_Z$rank
+
+inv_16sZ = multipatt(aZ, rank, func = "r.g", control = how(nperm=999))
+summary(inv_16sZ)
+
+#panel a for figure for paper
+#calculating the relative abundance of P.mac 
+RRA_16SP<- transform_sample_counts(ps16s.P, function(x) x/sum(x))
+#Making this a dataframe to merge
+dd_rra_otuP <- as.data.frame(t(otu_table(RRA_16SP)))
+tail(sort(colMeans(dd_rra_otuP)),10)
+#Creating an other category and leaving the one high (015967) and one low (016099) and top ten rel. abun ESV for Pmac
+dd_rra_otuP$other = rowSums(dd_rra_otuP[,1:1238])-dd_rra_otuP$ESV_015967-dd_rra_otuP$ESV_016099-
+  dd_rra_otuP$ESV_015974-dd_rra_otuP$ESV_008206-dd_rra_otuP$ESV_001019-dd_rra_otuP$ESV_000029-dd_rra_otuP$ESV_000261-
+  dd_rra_otuP$ESV_015966-dd_rra_otuP$ESV_015968-dd_rra_otuP$ESV_000464-dd_rra_otuP$ESV_000258 
+dd_rra_otuP = tibble::rownames_to_column(dd_rra_otuP, "ID")
+#new dataframe with just the categories of interest for P.mac (other, low and high, and top ten)
+RRA_16SP_3 = dd_rra_otuP[c('ID','ESV_016099', 'other', 'ESV_015967', 'ESV_015974', 'ESV_008206', 'ESV_001019', 'ESV_000029', 'ESV_000261', 'ESV_015966', 'ESV_015968', 'ESV_000464', 'ESV_000258')]
+library(reshape2)
+rra_16SP_3_m = melt(RRA_16SP_3, id.vars="ID", measure.vars = c('ESV_016099', 'ESV_015974', 'ESV_008206', 'ESV_001019', 'ESV_000029', 'ESV_000261', 'ESV_015966', 'ESV_015968', 'ESV_000464', 'ESV_000258', 'other', 'ESV_015967'))
+
+#Merging this dataframe with rank status and N fixation
+names(m16s_P)[1] = "ID"
+rra16S_Pnf = merge(m16s_P, rra_16SP_3_m, by = "ID")
+rra16S_Pnf$Nfixd = round(rra16S_Pnf$Nfixd, 3)
+finalP = rra16S_Pnf[c('ID','variable','value', 'rank', 'Nfixd')]
+
+
+fig3_panela = rra16S_Pnf %>%
+  mutate(ID_ = fct_reorder(ID, Nfixd)) %>%
+  ggplot(aes(x=ID_, y = value, fill = variable)) + 
+  geom_bar(stat="identity", color = "black") +
+  #geom_text(aes(label = Nfixd), position = top)+
+  scale_fill_manual(labels = c("Thermosporothrix", "Norcardia sp. 1", "Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium",
+                               "Burkholderia-Caballeronia-Paraburkholderia sp. 1", 
+                               "Diaphorobacter sp. 1", "Afipia sp. 1", "Bradyrhizobium sp. 1",
+                               "Burkholderia-Caballeronia-Paraburkholderia sp. 2",
+                               "Burkholderia-Caballeronia-Paraburkholderia sp. 3", 
+                               "Bradyrhizobium sp. 2", "Other", "Actinospica"), 
+                    values = c("#a1dab4", "#253494","#08306b" ,"#08519c", "#225ea8","#2171b5","#4292c6", "#6baed6", "#9ecae1","#c6dbef", "#deebf7", "#57be7a"))+
+   guides(fill=guide_legend(title="ESV Identity"))+
+  theme(legend.title = element_text(size = 12, face = "bold"), 
+     legend.text = element_text(size = 10, face = "italic"), legend.position = "right", 
+     axis.text.x = element_text(face = "bold",colour = "black", size = 12, angle = 90), 
+     axis.text.y = element_text(face = "bold", size = 12, colour = "black"), 
+     axis.title.y = element_text(face = "bold", size = 14, colour = "black"), 
+     panel.background = element_blank(), 
+     panel.border = element_rect(fill = NA, colour = "black"), 
+     legend.key=element_blank()) + 
+     labs(x= "", y = "Relative Abundance (%)")
+
+
+#panel b for figure for paper
+ps16s.P.ESV = as.data.frame(t(otu_table(ps16s.P)))
+ps16s.P.ESV = tibble::rownames_to_column(ps16s.P.ESV, "ID")
+ps16s.P.esvmerge = merge(m16s_P, ps16s.P.ESV, by = "ID")
+plot(ps16s.P.esvmerge$Nfixd~ps16s.P.esvmerge$ESV_015967)
+abline(test)
+
+cor.test(ps16s.P.esvmerge$Nfixd,ps16s.P.esvmerge$ESV_015967)
+
+
+#test of ESV importance 
+onlyes = finalP[finalP$variable == "ESV_015967",]
+onlyes$present = "Present"
+onlyes$present[onlyes$value == 0] = "Not Present"
+boxplot(onlyes$Nfixd~ onlyes$present)
+wilcox.test(onlyes$Nfixd~ onlyes$present)
+onlyes$present = as.factor(onlyes$present)
+
+
+fig3_panelb = onlyes %>%
+  mutate(present = fct_reorder(present,Nfixd)) %>%
+  ggplot(aes(x=present, y=Nfixd, fill=present))+
+  ylab(expression(atop("N fixation efficiency",paste(~(g~N~seedling^{-1}~hr^{-1})))))+
+  geom_boxplot()+
+    theme(legend.title = element_text(size = 12, face = "bold"), 
+     legend.text = element_text(size = 10, face = "bold"), legend.position = "none", 
+     axis.text.x = element_text(face = "bold",colour = "black", size = 12), 
+     axis.text.y = element_text(face = "bold", size = 12, colour = "black"), 
+     axis.title = element_text(face = "bold", size = 15, colour = "black"), 
+     axis.title.y = element_text(face = "bold", size = 15, colour = "black"), 
+     panel.background = element_blank(), 
+     panel.border = element_rect(fill = NA, colour = "black"), 
+     legend.key=element_blank()) + 
+     xlab("")+
+      scale_fill_manual(values = c("grey50","#57be7a"))
+
+
+#one panel figure 
+
+fig3 = ggarrange(fig3_panelb, fig3_panela,
+                 labels = c("A", "B"),
+                 ncol = 2, nrow =1,
+                 widths = c(.5,1.5))
+fig3
+
+fig3 = ggsave("figure3_52522.jpeg", width = 14, height = 8, units = "in")
+
+#Extra code to work in
+RRA_16SP<- transform_sample_counts(ps16s.P, function(x) x/sum(x))
+RRA_16SS <- transform_sample_counts(ps16s.S, function(x) x/sum(x))
+RRA_16SZ<- transform_sample_counts(ps16s.Z, function(x) x/sum(x))
+
+dd_rra_otuP <- as.data.frame(t(otu_table(RRA_16SP)))
+mean(dd_rra_otuP$ESV_015967)*100
+
+mean(dd_rra_otuP$ESV_016099)*100
+
+dd_rra_otuS <- as.data.frame(t(otu_table(RRA_16SS)))
+mean(dd_rra_otuS$ESV_015966)*100
+
+mean(dd_rra_otuS$ESV_000035)*100
+mean(dd_rra_otuS$ESV_000051)*100
+
+dd_rra_otuZ <- as.data.frame(t(otu_table(RRA_16SZ)))
+mean(dd_rra_otuZ$ESV_015966)*100
+
+mean(dd_rra_otuZ$ESV_009175)*100
+mean(dd_rra_otuZ$ESV_001048)*100
+mean(dd_rra_otuZ$ESV_001873)*100
+mean(dd_rra_otuZ$ESV_000035)*100
+mean(dd_rra_otuZ$ESV_015981)*100
+mean(dd_rra_otuZ$ESV_015970)*100
+mean(dd_rra_otuZ$ESV_004879)*100
+
+
+#Calculating landscape scale affect of every P.mac having this fixation rate
+pres = mean(onlyes[onlyes$present == "Present",]$Nfixd)
+n.pres = mean(onlyes[onlyes$present == "Not Present",]$Nfixd)
+
+fact = pres/n.pres
+
+```
